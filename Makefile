@@ -1,5 +1,5 @@
 BINARY   := sssh
-VERSION  := 1.0.0
+VERSION  := 1.1.0
 GOFLAGS  := -trimpath -ldflags="-s -w -X main.version=$(VERSION)"
 PREFIX   := /usr/local/bin
 

@@ -279,13 +279,62 @@ func buildSSHArgs(host, user, key string, port string, algoLevel AlgoLevel, extr
 	return args
 }
 
-// RetryLoop implements the main retry strategy:
-// for each algo level → for each user → for each key → probe.
-// If all keys fail, falls back to interactive password auth.
+// RetryLoop implements the main retry strategy.
+// Order: keychain password → SSH keys → interactive password fallback.
+// Each phase escalates through algo levels on negotiation failure.
 func RetryLoop(cfg *SSHConfig, host string, users []string, keys []string, extraArgs []string) error {
 	attempts := 0
+
+	// ── Phase 1: Keychain password (fastest path) ──
+	keychainCreds := KeychainLookupAll(host, cfg.Hostname)
+	if keychainCreds.Password != "" {
+		logVerbose("phase 1: trying keychain passwords")
+
+		// Build user list for password: keychain user first, then candidates.
+		pwUsers := []string{}
+		if keychainCreds.User != "" {
+			pwUsers = append(pwUsers, keychainCreds.User)
+		}
+		for _, u := range users {
+			if u != keychainCreds.User {
+				pwUsers = append(pwUsers, u)
+			}
+		}
+
+		for _, algoLvl := range AlgoLevels {
+			if algoLvl.Level > 0 {
+				logVerbose("password: escalating to algo level %d: %s", algoLvl.Level, algoLvl.Description)
+			}
+
+			for _, user := range pwUsers {
+				attempts++
+				logVerbose("attempt %d: user=%s (keychain password) algo=%d", attempts, user, algoLvl.Level)
+
+				exitCode, stderr := ProbeSSHWithPassword(host, user, keychainCreds.Password, cfg.Port, algoLvl, extraArgs)
+
+				if exitCode == 0 {
+					err := ExecSSHWithPassword(host, user, keychainCreds.Password, cfg.Port, algoLvl, extraArgs)
+					return fmt.Errorf("exec failed: %w", err)
+				}
+
+				failType, offer := ClassifyFailure(stderr)
+				logDebug("probe result: %s (exit=%d)", failType, exitCode)
+
+				if err := handleFatalFailure(failType, offer, host, cfg); err != nil {
+					return err
+				}
+				if failType == FailureNegotiation {
+					break // next algo level
+				}
+				// FailureAuthDenied → next user
+			}
+		}
+		logVerbose("keychain passwords exhausted, trying keys")
+	}
+
+	// ── Phase 2: SSH key rotation ──
+	logVerbose("phase 2: trying SSH keys")
 	minAlgoLevel := 0
-	// Track best algo level where host was reachable (auth failed, not negotiation).
 	bestAlgoLevel := -1
 	bestUser := ""
 	hadAuthDenied := false
@@ -296,7 +345,7 @@ func RetryLoop(cfg *SSHConfig, host string, users []string, keys []string, extra
 		}
 
 		if algoLvl.Level > 0 {
-			logWarn("escalating to algo level %d: %s", algoLvl.Level, algoLvl.Description)
+			logVerbose("keys: escalating to algo level %d: %s", algoLvl.Level, algoLvl.Description)
 		}
 
 		for _, user := range users {
@@ -307,68 +356,41 @@ func RetryLoop(cfg *SSHConfig, host string, users []string, keys []string, extra
 					keyDisplay = "(agent/default)"
 				}
 
-				logInfo("attempt %d: user=%s key=%s algo=%d",
+				logVerbose("attempt %d: user=%s key=%s algo=%d",
 					attempts, user, keyDisplay, algoLvl.Level)
 
 				exitCode, stderr := ProbeSSH(host, user, key, cfg.Port, algoLvl, extraArgs)
 
 				if exitCode == 0 {
-					// Success — exec interactive session.
 					err := ExecSSH(host, user, key, cfg.Port, algoLvl, extraArgs)
-					// If we reach here, exec failed.
 					return fmt.Errorf("exec failed: %w", err)
 				}
 
 				failType, offer := ClassifyFailure(stderr)
 				logDebug("probe result: %s (exit=%d)", failType, exitCode)
 
+				if err := handleFatalFailure(failType, offer, host, cfg); err != nil {
+					return err
+				}
+
 				switch failType {
 				case FailureAuthDenied:
 					hadAuthDenied = true
-					// Remember this algo level works for connectivity.
 					if bestAlgoLevel < algoLvl.Level {
-						bestAlgoLevel = algoLvl.Level
-						bestUser = user
-					} else if bestAlgoLevel == -1 {
 						bestAlgoLevel = algoLvl.Level
 						bestUser = user
 					}
 					continue
-
 				case FailureNegotiation:
-					// Smart skip: find minimum level that matches offer.
 					if offer != "" {
 						minLvl := FindMinLevel(offer)
 						if minLvl > algoLvl.Level {
-							logInfo("their offer: %s → jumping to level %d", offer, minLvl)
+							logVerbose("their offer: %s → jumping to level %d", offer, minLvl)
 							minAlgoLevel = minLvl
 						}
 					}
-					// Break out of user/key loops, go to next algo level.
 					goto nextAlgoLevel
-
-				case FailureHostKeyChange:
-					logError("HOST KEY CHANGED for %s", host)
-					logError("run: ssh-keygen -R %s", cfg.Hostname)
-					if cfg.Hostname != host {
-						logError("also try: ssh-keygen -R %s", host)
-					}
-					return fmt.Errorf("host key verification failed")
-
-				case FailureConnRefused:
-					logError("connection refused by %s", host)
-					return fmt.Errorf("connection refused")
-
-				case FailureTimeout:
-					logError("connection timed out for %s", host)
-					return fmt.Errorf("connection timed out")
-
-				case FailureDNS:
-					logError("cannot resolve %s", host)
-					return fmt.Errorf("DNS resolution failed")
-
 				default:
-					logDebug("unknown failure, stderr: %s", strings.TrimSpace(stderr))
 					continue
 				}
 			}
@@ -376,63 +398,44 @@ func RetryLoop(cfg *SSHConfig, host string, users []string, keys []string, extra
 	nextAlgoLevel:
 	}
 
-	// All key-based attempts exhausted.
-	if !hadAuthDenied {
-		return fmt.Errorf("exhausted %d attempts", attempts)
-	}
-
-	algoLvl := AlgoLevels[0]
-	if bestAlgoLevel >= 0 && bestAlgoLevel < len(AlgoLevels) {
-		algoLvl = AlgoLevels[bestAlgoLevel]
-	}
-
-	// Step 1: Try keychain password (non-interactive).
-	keychainCreds := KeychainLookupAll(host, cfg.Hostname)
-	if keychainCreds.Password != "" {
-		// Try keychain user+password first.
-		kcUser := keychainCreds.User
-		if kcUser == "" && len(users) > 0 {
-			kcUser = users[0]
+	// ── Phase 3: Interactive password fallback ──
+	if hadAuthDenied {
+		algoLvl := AlgoLevels[0]
+		if bestAlgoLevel >= 0 && bestAlgoLevel < len(AlgoLevels) {
+			algoLvl = AlgoLevels[bestAlgoLevel]
+		}
+		user := bestUser
+		if user == "" && len(users) > 0 {
+			user = users[0]
 		}
 
-		logInfo("trying keychain password for user=%s", kcUser)
-		exitCode, stderr := ProbeSSHWithPassword(host, kcUser, keychainCreds.Password, cfg.Port, algoLvl, extraArgs)
-
-		if exitCode == 0 {
-			err := ExecSSHWithPassword(host, kcUser, keychainCreds.Password, cfg.Port, algoLvl, extraArgs)
-			return fmt.Errorf("exec failed: %w", err)
-		}
-
-		failType, _ := ClassifyFailure(stderr)
-		logDebug("keychain password probe: %s", failType)
-
-		// If keychain user differs from candidates, also try each candidate user with keychain password.
-		if failType == FailureAuthDenied {
-			for _, user := range users {
-				if user == kcUser {
-					continue
-				}
-				logInfo("trying keychain password for user=%s", user)
-				exitCode, stderr = ProbeSSHWithPassword(host, user, keychainCreds.Password, cfg.Port, algoLvl, extraArgs)
-				if exitCode == 0 {
-					err := ExecSSHWithPassword(host, user, keychainCreds.Password, cfg.Port, algoLvl, extraArgs)
-					return fmt.Errorf("exec failed: %w", err)
-				}
-				failType, _ = ClassifyFailure(stderr)
-				if failType != FailureAuthDenied {
-					break
-				}
-			}
-		}
+		logWarn("phase 3: falling back to interactive password")
+		err := ExecSSH(host, user, "", cfg.Port, algoLvl, extraArgs)
+		return fmt.Errorf("exec failed: %w", err)
 	}
 
-	// Step 2: Fall back to interactive password prompt.
-	user := bestUser
-	if user == "" && len(users) > 0 {
-		user = users[0]
-	}
+	return fmt.Errorf("exhausted %d attempts", attempts)
+}
 
-	logWarn("falling back to interactive password auth")
-	err := ExecSSH(host, user, "", cfg.Port, algoLvl, extraArgs)
-	return fmt.Errorf("exec failed: %w", err)
+// handleFatalFailure checks for non-retryable failures and returns error if fatal.
+func handleFatalFailure(failType FailureType, offer, host string, cfg *SSHConfig) error {
+	switch failType {
+	case FailureHostKeyChange:
+		logError("HOST KEY CHANGED for %s", host)
+		logError("run: ssh-keygen -R %s", cfg.Hostname)
+		if cfg.Hostname != host {
+			logError("also try: ssh-keygen -R %s", host)
+		}
+		return fmt.Errorf("host key verification failed")
+	case FailureConnRefused:
+		logError("connection refused by %s", host)
+		return fmt.Errorf("connection refused")
+	case FailureTimeout:
+		logError("connection timed out for %s", host)
+		return fmt.Errorf("connection timed out")
+	case FailureDNS:
+		logError("cannot resolve %s", host)
+		return fmt.Errorf("DNS resolution failed")
+	}
+	return nil
 }

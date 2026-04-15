@@ -32,6 +32,12 @@ func logError(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, colorRed+prefix+colorReset+format+"\n", args...)
 }
 
+func logVerbose(format string, args ...any) {
+	if verboseMode {
+		fmt.Fprintf(os.Stderr, colorCyan+prefix+colorReset+format+"\n", args...)
+	}
+}
+
 func logDebug(format string, args ...any) {
 	if debugMode {
 		fmt.Fprintf(os.Stderr, colorGray+prefix+colorReset+format+"\n", args...)

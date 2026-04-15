@@ -3,20 +3,21 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 )
 
 var (
-	debugMode bool
-	version   = "dev"
+	debugMode   bool
+	verboseMode bool
+	version     = "dev"
 )
 
-// Known domains where sssh applies smart retry logic.
-var knownDomains = []string{
+// Known domain suffixes to try when bare hostname has no dots.
+var domainSuffixes = []string{
 	".inetlabs",
 	".de-cix.management",
 	".de-cix.net",
-	".parnassus.local",
 }
 
 func main() {
@@ -41,6 +42,9 @@ func main() {
 		switch args[i] {
 		case "--debug":
 			debugMode = true
+			verboseMode = true
+		case "-v", "--verbose":
+			verboseMode = true
 		case "-l":
 			// User explicitly passed -l user — respect it.
 			if i+1 < len(args) {
@@ -68,7 +72,10 @@ func main() {
 		target = parts[1]
 	}
 
-	logInfo("resolving config for %s", target)
+	// If bare hostname (no dots), try domain suffixes to find reachable host.
+	target = resolveWithDomainSuffix(target)
+
+	logVerbose("resolving config for %s", target)
 
 	cfg, err := ResolveSSHConfig(target)
 	if err != nil {
@@ -171,20 +178,61 @@ func deduplicateKeys(configKeys, discoveredKeys []string) []string {
 	return result
 }
 
+// resolveWithDomainSuffix tries appending known domain suffixes to a bare hostname.
+// Returns the first FQDN that resolves via DNS, or the original hostname if none match.
+func resolveWithDomainSuffix(host string) string {
+	// If host already has dots, it's already qualified — skip.
+	if strings.Contains(host, ".") {
+		return host
+	}
+
+	// Check if bare hostname resolves in SSH config (hostname differs from input).
+	cfg, err := ResolveSSHConfig(host)
+	if err == nil && cfg.Hostname != host {
+		logDebug("bare host %s resolves to %s via ssh config", host, cfg.Hostname)
+		return host
+	}
+
+	// Try each domain suffix.
+	for _, suffix := range domainSuffixes {
+		candidate := host + suffix
+		logDebug("trying domain suffix: %s", candidate)
+		if dnsResolves(candidate) {
+			logInfo("resolved %s → %s", host, candidate)
+			return candidate
+		}
+	}
+
+	logDebug("no domain suffix matched for %s, using as-is", host)
+	return host
+}
+
+// dnsResolves checks if a hostname resolves via DNS.
+func dnsResolves(host string) bool {
+	cmd := exec.Command("host", "-W", "2", host)
+	err := cmd.Run()
+	return err == nil
+}
+
 func printUsage() {
-	fmt.Fprintf(os.Stderr, `sssh — Smart SSH Wrapper
+	fmt.Fprintf(os.Stderr, `sssh %s — Smart SSH Wrapper
 
 Usage: sssh [--debug] [ssh-options] <host>
 
-Smart SSH wrapper with:
-  - Auto user resolution (ssh config → macOS Keychain → OS user)
-  - SSH key rotation on auth failure
-  - Algorithm escalation for legacy devices
-  - Colored status output
+Auth order:
+  1. Keychain password (for each user candidate)
+  2. SSH key rotation (ed25519 → ecdsa → rsa → dsa → agent)
+  3. Interactive password prompt
+
+Domain suffix discovery:
+  Bare hostnames (no dots) are tried with:
+    .inetlabs  .de-cix.management  .de-cix.net
 
 Options:
-  --debug    Show verbose debug output
-  --help     Show this help
+  -v          Show per-attempt details
+  --debug     Show full debug output (implies -v)
+  --version   Show version
+  --help      Show this help
 
 All other options are passed through to ssh.
 
@@ -192,6 +240,6 @@ Examples:
   sssh proxmox           Connect to known host
   sssh root@192.168.1.1  Explicit user
   sssh --debug router1   Debug connection issues
-  sssh -p 2222 myhost    Custom port
-`)
+  sssh mydevice          Tries mydevice.inetlabs, etc.
+`, version)
 }
