@@ -1,0 +1,6 @@
+sssh
+sssh-arm64
+sssh-amd64
+sssh-universal
+*.tar.gz
+*.rsls
